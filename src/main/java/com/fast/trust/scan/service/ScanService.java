@@ -1,5 +1,9 @@
 package com.fast.trust.scan.service;
 
+import com.fast.trust.ai.dto.AiRstDto;
+import com.fast.trust.ai.service.AiService;
+import com.fast.trust.scan.dto.SSEDto;
+import com.fast.trust.scan.dto.SSE_TYPE;
 import com.fast.trust.scan.dto.ScanScoreResult;
 import com.fast.trust.scan.entity.ScanDetail;
 import com.fast.trust.scan.entity.ScanMaster;
@@ -34,6 +38,7 @@ public class ScanService {
     private final ObjectMapper objectMapper = new ObjectMapper();
     private final ScanMasterRepository scanMasterRepository;
     private final ScanDetailRepository scanDetailRepository;
+    private final AiService aiService;
 
     private static final Set<String> HIGH_RISK_INFO_TEMPLATES = Set.of(
             "ssl-expired",
@@ -57,13 +62,12 @@ public class ScanService {
             scanMasterRepository.save(scanMaster);
 
             try {
+                SSEDto sseDto = new SSEDto();
+                sseDto.setType(SSE_TYPE.START.name());
+                sseDto.setScanId(scanId);
                 emitter.send(SseEmitter.event()
                         .name("init")
-                        .data(Map.of(
-                                "scanId", scanId,
-                                "url", normalizedUrl,
-                                "status", "PROCESSING"
-                        )));
+                        .data(sseDto));
 
                 ProcessBuilder processBuilder = new ProcessBuilder(
                         nucleiPath,
@@ -100,13 +104,19 @@ public class ScanService {
                             progressData.put("lineNumber", lineNumber);
                             progressData.put("timestamp", System.currentTimeMillis());
                             progressData.put("data", jsonData);
-
+                            sseDto = new SSEDto();
                             // 취약점 발견 시
                             if (jsonData.containsKey("info")) {
                                 findings.add(jsonData);
                                 try {
+                                    sseDto.setType(SSE_TYPE.FIND.name());
                                     ScanDetail detail = toScanDetail(scanId, jsonData);
                                     scanDetailRepository.save(detail);
+                                    sseDto.setScanDetailId(String.valueOf(detail.getId()));
+                                    sseDto.setName(detail.getName());
+                                    sseDto.setSeverity(detail.getSeverity());
+                                    sseDto.setDescription(detail.getDescription());
+                                    sseDto.setAiAnalyzed(false);
                                     log.info("Finding detected: {} - {}",
                                             detail.getName(),
                                             detail.getSeverity());
@@ -118,14 +128,18 @@ public class ScanService {
                             } else if (jsonData.containsKey("stats")) {
                                 // 통계 정보
                                 progressData.put("type", "stats");
+                                sseDto.setType(SSE_TYPE.PROGRESS.name());
+                                sseDto.setPercent((String)jsonData.get("percent"));
                             } else {
                                 progressData.put("type", "info");
+                                sseDto.setType(SSE_TYPE.PROGRESS.name());
+                                sseDto.setPercent((String)jsonData.get("percent"));
                             }
 
                             // SSE로 전송
                             emitter.send(SseEmitter.event()
                                     .name("progress")
-                                    .data(progressData));
+                                    .data(sseDto));
 
                             log.debug("Line {}: {}", lineNumber, cleanLine); // ✅ debug 레벨로 변경
 
@@ -137,16 +151,15 @@ public class ScanService {
                             textData.put("message", cleanLine);
                             textData.put("timestamp", System.currentTimeMillis());
 
-                            emitter.send(SseEmitter.event()
+/*                            emitter.send(SseEmitter.event()
                                     .name("progress")
-                                    .data(textData));
+                                    .data(textData));*/
 
                             log.debug("Text line {}: {}", lineNumber, cleanLine);
                         }
                     } catch (JsonProcessingException e) {
                         log.warn("Failed to parse JSON at line {}: {}", lineNumber, cleanLine);
 
-                        // ✅ JSON 파싱 에러는 경고만 (치명적이지 않음)
                         Map<String, Object> errorData = new HashMap<>();
                         errorData.put("lineNumber", lineNumber);
                         errorData.put("type", "parse_error");
@@ -200,9 +213,14 @@ public class ScanService {
                 completionData.put("timestamp", System.currentTimeMillis());
                 completionData.put("url", normalizedUrl); // ✅ URL 추가
 
+                sseDto = new SSEDto();
+                sseDto.setType(SSE_TYPE.END.name());
+                sseDto.setGrade(score.grade());
+                sseDto.setScore(score.score());
+
                 emitter.send(SseEmitter.event()
                         .name("complete")
-                        .data(completionData));
+                        .data(sseDto));
 
                 emitter.complete();
 
@@ -254,54 +272,6 @@ public class ScanService {
                 }
             }
         });
-    }
-
-    /**
-     * 일반 스캔 (전체 결과 반환)
-     */
-    public Map<String, Object> scanUrl(String url) throws Exception {
-        List<String> command = Arrays.asList(
-                nucleiPath,
-                "-u", url,
-                "-json",
-                "-silent"
-        );
-
-        ProcessBuilder processBuilder = new ProcessBuilder(command);
-        processBuilder.redirectErrorStream(true);
-        Process process = processBuilder.start();
-
-        BufferedReader reader = new BufferedReader(
-                new InputStreamReader(process.getInputStream())
-        );
-
-        List<Map<String, Object>> results = new ArrayList<>();
-        String line;
-
-        int lineNumber = 0;
-        int estimatedTotalRequests = 100;
-        while ((line = reader.readLine()) != null) {
-            lineNumber++;
-            if (line.trim().startsWith("{")) {
-                try {
-                    Map<String, Object> jsonData = objectMapper.readValue(line, Map.class);
-                    results.add(jsonData);
-                } catch (Exception e) {
-                    log.error("Error parsing JSON: {}", line, e);
-                }
-            }
-        }
-
-        int exitCode = process.waitFor();
-
-        Map<String, Object> response = new HashMap<>();
-        response.put("url", url);
-        response.put("exitCode", exitCode);
-        response.put("findings", results);
-        response.put("totalFindings", results.size());
-        response.put("timestamp", System.currentTimeMillis());
-
-        return response;
     }
 
     /**
@@ -468,5 +438,409 @@ public class ScanService {
         if (score >= 50) return "C";
         if (score >= 40) return "D";
         return "F";
+    }
+
+    public void scanUrlWithStreamAi(String url, SseEmitter emitter) {
+        String normalizedUrl = normalizeUrl(url);
+
+        CompletableFuture.runAsync(() -> {
+            Process process = null; // ✅ try-finally에서 정리하기 위해
+            BufferedReader reader = null;
+            String scanId = UUID.randomUUID().toString();
+
+            ScanMaster scanMaster = new ScanMaster(scanId, normalizedUrl);
+            scanMasterRepository.save(scanMaster);
+
+            try {
+                SSEDto sseDto = new SSEDto();
+                sseDto.setType(SSE_TYPE.START.name());
+                sseDto.setScanId(scanId);
+                emitter.send(SseEmitter.event()
+                        .name("init")
+                        .data(sseDto));
+
+                ProcessBuilder processBuilder = new ProcessBuilder(
+                        nucleiPath,
+                        "-u", normalizedUrl,
+                        "-jsonl",
+                        "-stats",
+                        "-silent"
+                );
+
+                processBuilder.redirectErrorStream(true);
+                process = processBuilder.start();
+
+                reader = new BufferedReader(
+                        new InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8)
+                );
+
+                String line;
+                int lineNumber = 0;
+                List<Map<String, Object>> findings = new ArrayList<>();
+
+                while ((line = reader.readLine()) != null) {
+                    lineNumber++;
+
+                    String cleanLine = line.replaceAll("\u001b\\[[0-9;]*m", "");
+                    try {
+                        // JSON 라인 파싱
+                        if (cleanLine.trim().startsWith("{")) {
+                            Map<String, Object> jsonData = objectMapper.readValue(cleanLine, Map.class);
+
+                            jsonData = filterLongFields(jsonData);
+
+                            // 진행 상황 데이터 생성
+                            Map<String, Object> progressData = new HashMap<>();
+                            progressData.put("lineNumber", lineNumber);
+                            progressData.put("timestamp", System.currentTimeMillis());
+                            progressData.put("data", jsonData);
+                            sseDto = new SSEDto();
+                            // 취약점 발견 시
+                            if (jsonData.containsKey("info")) {
+                                findings.add(jsonData);
+                                try {
+                                    ScanDetail detail = toScanDetail(scanId, jsonData);
+                                    scanDetailRepository.save(detail);
+                                    AiRstDto result = aiService.analyze(detail);
+                                    sseDto = aiService.saveResult(detail, result);
+                                    sseDto.setType(SSE_TYPE.FIND.name());
+                                    log.info("Finding detected: {} - {}",
+                                            detail.getName(),
+                                            detail.getSeverity());
+                                } catch (Exception e) {
+                                    log.error("Failed to save ScanDetail: {}", e.getMessage(), e);
+                                }
+                                progressData.put("type", "finding");
+                                progressData.put("totalFindings", findings.size());
+                            } else if (jsonData.containsKey("stats")) {
+                                // 통계 정보
+                                progressData.put("type", "stats");
+                                sseDto.setType(SSE_TYPE.PROGRESS.name());
+                                sseDto.setPercent((String)jsonData.get("percent"));
+                            } else {
+                                progressData.put("type", "info");
+                                sseDto.setType(SSE_TYPE.PROGRESS.name());
+                                sseDto.setPercent((String)jsonData.get("percent"));
+                            }
+
+                            // SSE로 전송
+                            emitter.send(SseEmitter.event()
+                                    .name("progress")
+                                    .data(sseDto));
+
+                            log.debug("Line {}: {}", lineNumber, cleanLine); // ✅ debug 레벨로 변경
+
+                        } else if (!cleanLine.trim().isEmpty()) { // ✅ 빈 줄 무시
+                            // 일반 텍스트 출력
+                            Map<String, Object> textData = new HashMap<>();
+                            textData.put("lineNumber", lineNumber);
+                            textData.put("type", "text");
+                            textData.put("message", cleanLine);
+                            textData.put("timestamp", System.currentTimeMillis());
+
+/*                            emitter.send(SseEmitter.event()
+                                    .name("progress")
+                                    .data(textData));*/
+
+                            log.debug("Text line {}: {}", lineNumber, cleanLine);
+                        }
+                    } catch (JsonProcessingException e) {
+                        log.warn("Failed to parse JSON at line {}: {}", lineNumber, cleanLine);
+
+                        Map<String, Object> errorData = new HashMap<>();
+                        errorData.put("lineNumber", lineNumber);
+                        errorData.put("type", "parse_error");
+                        errorData.put("message", "JSON parse failed: " + e.getMessage());
+                        errorData.put("rawLine", cleanLine);
+
+                        emitter.send(SseEmitter.event()
+                                .name("warning")
+                                .data(errorData));
+
+                    } catch (Exception e) {
+                        log.error("Error processing line {}: {}", lineNumber, cleanLine, e);
+
+                        // 에러 정보 전송
+                        Map<String, Object> errorData = new HashMap<>();
+                        errorData.put("lineNumber", lineNumber);
+                        errorData.put("type", "error");
+                        errorData.put("message", e.getMessage());
+                        errorData.put("rawLine", cleanLine);
+
+                        emitter.send(SseEmitter.event()
+                                .name("error")
+                                .data(errorData));
+                    }
+                }
+
+                // ✅ 타임아웃 포함 대기
+                boolean finished = process.waitFor(300, TimeUnit.SECONDS); // 5분
+
+                if (!finished) {
+                    log.warn("Nuclei process timeout, forcibly destroying");
+                    process.destroyForcibly();
+                }
+
+                int exitCode = process.exitValue();
+                scanMaster.complete();
+
+                List<ScanDetail> details = scanDetailRepository.findByScanId(scanId);
+                ScanScoreResult score = calculateScore(details);
+                scanMaster.setScore(score.score());
+                scanMaster.setGrade(score.grade());
+                scanMasterRepository.save(scanMaster);
+
+                // 완료 메시지 전송
+                Map<String, Object> completionData = new HashMap<>();
+                completionData.put("type", "complete");
+                completionData.put("exitCode", exitCode);
+                completionData.put("totalLines", lineNumber);
+                completionData.put("totalFindings", findings.size());
+                completionData.put("findings", findings);
+                completionData.put("timestamp", System.currentTimeMillis());
+                completionData.put("url", normalizedUrl); // ✅ URL 추가
+
+                sseDto = new SSEDto();
+                sseDto.setType(SSE_TYPE.END.name());
+                sseDto.setGrade(score.grade());
+                sseDto.setScore(score.score());
+
+                emitter.send(SseEmitter.event()
+                        .name("complete")
+                        .data(sseDto));
+
+                emitter.complete();
+
+                log.info("Scan completed for {}: Exit code: {}, Total lines: {}, Findings: {}",
+                        normalizedUrl, exitCode, lineNumber, findings.size());
+
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt(); // ✅ 인터럽트 상태 복원
+                log.error("Scan interrupted for {}", normalizedUrl, e);
+
+                try {
+                    emitter.send(SseEmitter.event()
+                            .name("error")
+                            .data(Map.of(
+                                    "type", "interrupted",
+                                    "message", "Scan was interrupted"
+                            )));
+                } catch (IOException ignored) {}
+                emitter.completeWithError(e);
+
+            } catch (Exception e) {
+                log.error("Error during scan for {}", normalizedUrl, e);
+                scanMaster.fail(e.getMessage());
+                scanMasterRepository.save(scanMaster);
+
+                try {
+                    emitter.send(SseEmitter.event()
+                            .name("error")
+                            .data(Map.of(
+                                    "type", "fatal",
+                                    "message", e.getMessage(),
+                                    "url", normalizedUrl
+                            )));
+                } catch (IOException ignored) {}
+                emitter.completeWithError(e);
+
+            } finally {
+                if (reader != null) {
+                    try {
+                        reader.close();
+                    } catch (IOException e) {
+                        log.warn("Failed to close reader", e);
+                    }
+                }
+
+                if (process != null && process.isAlive()) {
+                    log.warn("Process still alive, destroying forcibly");
+                    process.destroyForcibly();
+                }
+            }
+        });
+    }
+
+    public List<SSEDto> mcpAll(String url) {
+        String normalizedUrl = normalizeUrl(url);
+
+        List<SSEDto> dtoList = new ArrayList<>();
+        CompletableFuture.runAsync(() -> {
+            Process process = null; // ✅ try-finally에서 정리하기 위해
+            BufferedReader reader = null;
+            String scanId = UUID.randomUUID().toString();
+
+            ScanMaster scanMaster = new ScanMaster(scanId, normalizedUrl);
+            scanMasterRepository.save(scanMaster);
+
+            try {
+                SSEDto sseDto = new SSEDto();
+                sseDto.setType(SSE_TYPE.START.name());
+                sseDto.setScanId(scanId);
+                dtoList.add(sseDto);
+
+                ProcessBuilder processBuilder = new ProcessBuilder(
+                        nucleiPath,
+                        "-u", normalizedUrl,
+                        "-jsonl",
+                        "-stats",
+                        "-silent"
+                );
+
+                processBuilder.redirectErrorStream(true);
+                process = processBuilder.start();
+
+                reader = new BufferedReader(
+                        new InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8)
+                );
+
+                String line;
+                int lineNumber = 0;
+                List<Map<String, Object>> findings = new ArrayList<>();
+
+                while ((line = reader.readLine()) != null) {
+                    lineNumber++;
+
+                    String cleanLine = line.replaceAll("\u001b\\[[0-9;]*m", "");
+                    try {
+                        // JSON 라인 파싱
+                        if (cleanLine.trim().startsWith("{")) {
+                            Map<String, Object> jsonData = objectMapper.readValue(cleanLine, Map.class);
+
+                            jsonData = filterLongFields(jsonData);
+
+                            // 진행 상황 데이터 생성
+                            Map<String, Object> progressData = new HashMap<>();
+                            progressData.put("lineNumber", lineNumber);
+                            progressData.put("timestamp", System.currentTimeMillis());
+                            progressData.put("data", jsonData);
+                            sseDto = new SSEDto();
+                            // 취약점 발견 시
+                            if (jsonData.containsKey("info")) {
+                                findings.add(jsonData);
+                                try {
+                                    ScanDetail detail = toScanDetail(scanId, jsonData);
+                                    scanDetailRepository.save(detail);
+                                    AiRstDto result = aiService.analyze(detail);
+                                    sseDto = aiService.saveResult(detail, result);
+                                    sseDto.setType(SSE_TYPE.FIND.name());
+                                    log.info("Finding detected: {} - {}",
+                                            detail.getName(),
+                                            detail.getSeverity());
+                                } catch (Exception e) {
+                                    log.error("Failed to save ScanDetail: {}", e.getMessage(), e);
+                                }
+                                progressData.put("type", "finding");
+                                progressData.put("totalFindings", findings.size());
+                            } else if (jsonData.containsKey("stats")) {
+                                // 통계 정보
+                                progressData.put("type", "stats");
+                                sseDto.setType(SSE_TYPE.PROGRESS.name());
+                                sseDto.setPercent((String)jsonData.get("percent"));
+                            } else {
+                                progressData.put("type", "info");
+                                sseDto.setType(SSE_TYPE.PROGRESS.name());
+                                sseDto.setPercent((String)jsonData.get("percent"));
+                            }
+                            dtoList.add(sseDto);
+
+                            log.debug("Line {}: {}", lineNumber, cleanLine); // ✅ debug 레벨로 변경
+
+                        } else if (!cleanLine.trim().isEmpty()) { // ✅ 빈 줄 무시
+                            // 일반 텍스트 출력
+                            Map<String, Object> textData = new HashMap<>();
+                            textData.put("lineNumber", lineNumber);
+                            textData.put("type", "text");
+                            textData.put("message", cleanLine);
+                            textData.put("timestamp", System.currentTimeMillis());
+
+/*                            emitter.send(SseEmitter.event()
+                                    .name("progress")
+                                    .data(textData));*/
+
+                            log.debug("Text line {}: {}", lineNumber, cleanLine);
+                        }
+                    } catch (JsonProcessingException e) {
+                        log.warn("Failed to parse JSON at line {}: {}", lineNumber, cleanLine);
+
+                        Map<String, Object> errorData = new HashMap<>();
+                        errorData.put("lineNumber", lineNumber);
+                        errorData.put("type", "parse_error");
+                        errorData.put("message", "JSON parse failed: " + e.getMessage());
+                        errorData.put("rawLine", cleanLine);
+                        dtoList.add(sseDto);
+
+                    } catch (Exception e) {
+                        log.error("Error processing line {}: {}", lineNumber, cleanLine, e);
+
+                        // 에러 정보 전송
+                        Map<String, Object> errorData = new HashMap<>();
+                        errorData.put("lineNumber", lineNumber);
+                        errorData.put("type", "error");
+                        errorData.put("message", e.getMessage());
+                        errorData.put("rawLine", cleanLine);
+                        dtoList.add(sseDto);
+                    }
+                }
+
+                // ✅ 타임아웃 포함 대기
+                boolean finished = process.waitFor(300, TimeUnit.SECONDS); // 5분
+
+                if (!finished) {
+                    log.warn("Nuclei process timeout, forcibly destroying");
+                    process.destroyForcibly();
+                }
+
+                int exitCode = process.exitValue();
+                scanMaster.complete();
+
+                List<ScanDetail> details = scanDetailRepository.findByScanId(scanId);
+                ScanScoreResult score = calculateScore(details);
+                scanMaster.setScore(score.score());
+                scanMaster.setGrade(score.grade());
+                scanMasterRepository.save(scanMaster);
+
+                // 완료 메시지 전송
+                Map<String, Object> completionData = new HashMap<>();
+                completionData.put("type", "complete");
+                completionData.put("exitCode", exitCode);
+                completionData.put("totalLines", lineNumber);
+                completionData.put("totalFindings", findings.size());
+                completionData.put("findings", findings);
+                completionData.put("timestamp", System.currentTimeMillis());
+                completionData.put("url", normalizedUrl); // ✅ URL 추가
+
+                sseDto = new SSEDto();
+                sseDto.setType(SSE_TYPE.END.name());
+                sseDto.setGrade(score.grade());
+                sseDto.setScore(score.score());
+                dtoList.add(sseDto);
+
+                log.info("Scan completed for {}: Exit code: {}, Total lines: {}, Findings: {}",
+                        normalizedUrl, exitCode, lineNumber, findings.size());
+
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt(); // ✅ 인터럽트 상태 복원
+                log.error("Scan interrupted for {}", normalizedUrl, e);
+            } catch (Exception e) {
+                log.error("Error during scan for {}", normalizedUrl, e);
+                scanMaster.fail(e.getMessage());
+                scanMasterRepository.save(scanMaster);
+            } finally {
+                if (reader != null) {
+                    try {
+                        reader.close();
+                    } catch (IOException e) {
+                        log.warn("Failed to close reader", e);
+                    }
+                }
+
+                if (process != null && process.isAlive()) {
+                    log.warn("Process still alive, destroying forcibly");
+                    process.destroyForcibly();
+                }
+            }
+        });
+        return null;
     }
 }

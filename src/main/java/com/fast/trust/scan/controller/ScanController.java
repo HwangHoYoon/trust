@@ -1,13 +1,18 @@
 package com.fast.trust.scan.controller;
 
+import com.fast.trust.scan.dto.SSEDto;
 import com.fast.trust.scan.service.ScanService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
-import org.springframework.web.bind.annotation.*;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
+import java.util.List;
 import java.util.Map;
 
 @RestController
@@ -32,23 +37,16 @@ public class ScanController {
         return emitter;
     }
 
-    /**
-     * 일반 POST 요청으로 스캔 (결과만 반환)
-     * POST /api/nuclei/scan
-     */
-    @PostMapping("/scan")
-    public ResponseEntity<Map<String, Object>> scan(@RequestBody Map<String, String> request) {
-        String url = request.get("url");
-        log.info("Starting Nuclei scan for URL: {}", url);
+    @GetMapping(value = "/streamAll", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    public SseEmitter streamAll(@RequestParam String url) throws Exception {
+        SseEmitter emitter = new SseEmitter(600000L); // 5분 타임아웃
+        scanService.scanUrlWithStreamAi(url, emitter);
+        return emitter;
+    }
 
-        try {
-            Map<String, Object> result = scanService.scanUrl(url);
-            return ResponseEntity.ok(result);
-        } catch (Exception e) {
-            log.error("Scan failed", e);
-            return ResponseEntity.internalServerError()
-                    .body(Map.of("error", e.getMessage()));
-        }
+    @GetMapping(value = "/mcpAll")
+    public List<SSEDto> mcpAll(@RequestParam String url) throws Exception {
+        return scanService.mcpAll(url);
     }
 
     /**

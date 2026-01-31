@@ -1,6 +1,8 @@
 package com.fast.trust.ai.service;
 
 import com.fast.trust.ai.dto.AiRstDto;
+import com.fast.trust.scan.dto.SSEDto;
+import com.fast.trust.scan.dto.SSE_TYPE;
 import com.fast.trust.scan.entity.ScanDetail;
 import com.fast.trust.scan.repository.ScanDetailRepository;
 import com.fasterxml.jackson.core.type.TypeReference;
@@ -10,9 +12,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.stereotype.Service;
 
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 
 @Service
 @Slf4j
@@ -177,18 +177,18 @@ public class AiService {
         );
     }
 
-    public List<ScanDetail> analyzeScan(String scanId) {
+    public List<SSEDto> analyzeScan(String scanId) {
         List<ScanDetail> scanDetailList = scanDetailRepository.findByScanId(scanId);
-
+        List<SSEDto> sseDtoList = new ArrayList<>();
         for (ScanDetail scanDetail : scanDetailList) {
             AiRstDto result = analyze(scanDetail);
-            saveResult(scanDetail, result);
+            sseDtoList.add(saveResult(scanDetail, result));
         }
 
-        return scanDetailList;
+        return sseDtoList;
     }
 
-    private void saveResult(ScanDetail scanDetail, AiRstDto result) {
+    public SSEDto saveResult(ScanDetail scanDetail, AiRstDto result) {
 
         // 1️⃣ 전체 AI 결과 JSON (백업 / 디버깅용)
         Map<String, Object> aiResult = new HashMap<>();
@@ -225,6 +225,21 @@ public class AiService {
         scanDetail.setAiAnalyzed(true);
 
         scanDetailRepository.save(scanDetail);
+        SSEDto sSEDto = new SSEDto();
+        sSEDto.setType(SSE_TYPE.AI.name());
+        sSEDto.setScanId(scanDetail.getScanId());
+        sSEDto.setScanDetailId(String.valueOf(scanDetail.getId()));
+        sSEDto.setName(scanDetail.getName());
+        sSEDto.setDescription(scanDetail.getDescription());
+        sSEDto.setSeverity(scanDetail.getSeverity());
+        sSEDto.setAiAnalyzed(true);
+        sSEDto.setAiImpact(scanDetail.getAiImpact());
+        sSEDto.setAiReferences(scanDetail.getAiReferences());
+        sSEDto.setAiFixSteps(scanDetail.getAiFixSteps());
+        sSEDto.setAiBeforeCode(scanDetail.getAiBeforeCode());
+        sSEDto.setAiAfterCode(scanDetail.getAiAfterCode());
+        sSEDto.setAiDescription(scanDetail.getAiDescription());
+        return sSEDto;
     }
 
     private String extractJsonBlock(String text) {
@@ -246,5 +261,11 @@ public class AiService {
         json = json.replaceAll(":\\s*\"\"([^\"]*)\"\"", ": \"$1\"");
 
         return json;
+    }
+
+    public SSEDto analyzeScanDetail(String scanDetailId) {
+        ScanDetail scanDetail = scanDetailRepository.findById(Long.parseLong(scanDetailId)).orElseThrow(() -> new IllegalArgumentException("존재하지 않는 scanDetailId: " + scanDetailId));;
+        AiRstDto result = analyze(scanDetail);
+        return saveResult(scanDetail, result);
     }
 }
