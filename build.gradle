@@ -42,6 +42,11 @@ dependencies {
 
     // ai
     implementation 'org.springframework.ai:spring-ai-anthropic-spring-boot-starter'
+    // Spring AI
+    implementation 'org.springframework.ai:spring-ai-starter-mcp-server-webflux:1.1.2'
+    implementation 'org.springframework.ai:spring-ai-jsoup-document-reader:1.1.2'
+    implementation 'org.springframework.boot:spring-boot-starter-webflux'
+    testImplementation 'io.projectreactor:reactor-test'
 }
 dependencyManagement {
     imports {
