@@ -663,182 +663,113 @@ public class ScanService {
 
     public List<SSEDto> mcpAll(String url) {
         String normalizedUrl = normalizeUrl(url);
-
         List<SSEDto> dtoList = new ArrayList<>();
-            Process process = null; // ✅ try-finally에서 정리하기 위해
-            BufferedReader reader = null;
-            String scanId = UUID.randomUUID().toString();
+        Process process = null;
+        BufferedReader reader = null;
+        String scanId = UUID.randomUUID().toString();
 
-            ScanMaster scanMaster = new ScanMaster(scanId, normalizedUrl);
-            scanMasterRepository.save(scanMaster);
+        ScanMaster scanMaster = new ScanMaster(scanId, normalizedUrl);
+        scanMasterRepository.save(scanMaster);
 
-            try {
-                SSEDto sseDto = new SSEDto();
-                sseDto.setType(SSE_TYPE.START.name());
-                sseDto.setScanId(scanId);
-                dtoList.add(sseDto);
+        try {
+            // Process 시작
+            ProcessBuilder processBuilder = new ProcessBuilder(
+                    nucleiPath,
+                    "-u", normalizedUrl,
+                    "-jsonl",
+                    "-stats",
+                    "-silent"
+            );
+            processBuilder.redirectErrorStream(true);
+            process = processBuilder.start();
 
-                ProcessBuilder processBuilder = new ProcessBuilder(
-                        nucleiPath,
-                        "-u", normalizedUrl,
-                        "-jsonl",
-                        "-stats",
-                        "-silent"
-                );
+            reader = new BufferedReader(
+                    new InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8)
+            );
 
-                processBuilder.redirectErrorStream(true);
-                process = processBuilder.start();
+            String line;
+            List<Map<String, Object>> findings = new ArrayList<>();
+            int lineNumber = 0;
 
-                reader = new BufferedReader(
-                        new InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8)
-                );
+            while ((line = reader.readLine()) != null) {
+                lineNumber++;
+                String cleanLine = line.replaceAll("\u001b\\[[0-9;]*m", "");
 
-                String line;
-                int lineNumber = 0;
-                List<Map<String, Object>> findings = new ArrayList<>();
-
-                while ((line = reader.readLine()) != null) {
-                    lineNumber++;
-
-                    String cleanLine = line.replaceAll("\u001b\\[[0-9;]*m", "");
+                if (cleanLine.trim().startsWith("{")) {
                     try {
-                        // JSON 라인 파싱
-                        if (cleanLine.trim().startsWith("{")) {
-                            Map<String, Object> jsonData = objectMapper.readValue(cleanLine, Map.class);
+                        Map<String, Object> jsonData = objectMapper.readValue(cleanLine, Map.class);
+                        jsonData = filterLongFields(jsonData);
 
-                            jsonData = filterLongFields(jsonData);
-
-                            // 진행 상황 데이터 생성
-                            Map<String, Object> progressData = new HashMap<>();
-                            progressData.put("lineNumber", lineNumber);
-                            progressData.put("timestamp", System.currentTimeMillis());
-                            progressData.put("data", jsonData);
-                            sseDto = new SSEDto();
-                            // 취약점 발견 시
-                            if (jsonData.containsKey("info")) {
-                                findings.add(jsonData);
-                                try {
-                                    ScanDetail detail = toScanDetail(scanId, jsonData);
-                                    scanDetailRepository.save(detail);
-                                    AiRstDto result = aiService.analyze(detail);
-                                    sseDto = aiService.saveResult(detail, result);
-                                    sseDto.setType(SSE_TYPE.FIND.name());
-                                    log.info("Finding detected: {} - {}",
-                                            detail.getName(),
-                                            detail.getSeverity());
-                                } catch (Exception e) {
-                                    log.error("Failed to save ScanDetail: {}", e.getMessage(), e);
-                                }
-                                progressData.put("type", "finding");
-                                progressData.put("totalFindings", findings.size());
-                            } else if (jsonData.containsKey("stats")) {
-                                // 통계 정보
-                                progressData.put("type", "stats");
-                                sseDto.setType(SSE_TYPE.PROGRESS.name());
-                                sseDto.setPercent((String)jsonData.get("percent"));
-                            } else {
-                                progressData.put("type", "info");
-                                sseDto.setType(SSE_TYPE.PROGRESS.name());
-                                sseDto.setPercent((String)jsonData.get("percent"));
+                        // 취약점 발견 시 처리
+                        if (jsonData.containsKey("info")) {
+                            findings.add(jsonData);
+                            try {
+                                ScanDetail detail = toScanDetail(scanId, jsonData);
+                                scanDetailRepository.save(detail);
+                                AiRstDto result = aiService.analyze(detail);
+                                SSEDto sseDto = aiService.saveResult(detail, result);
+                                sseDto.setType(SSE_TYPE.FIND.name());
+                                dtoList.add(sseDto);
+                                log.info("Finding detected: {} - {}", detail.getName(), detail.getSeverity());
+                            } catch (Exception e) {
+                                log.error("Failed to save ScanDetail: {}", e.getMessage(), e);
                             }
-                            dtoList.add(sseDto);
-
-                            log.debug("Line {}: {}", lineNumber, cleanLine); // ✅ debug 레벨로 변경
-
-                        } else if (!cleanLine.trim().isEmpty()) { // ✅ 빈 줄 무시
-                            // 일반 텍스트 출력
-                            Map<String, Object> textData = new HashMap<>();
-                            textData.put("lineNumber", lineNumber);
-                            textData.put("type", "text");
-                            textData.put("message", cleanLine);
-                            textData.put("timestamp", System.currentTimeMillis());
-
-/*                            emitter.send(SseEmitter.event()
-                                    .name("progress")
-                                    .data(textData));*/
-
-                            log.debug("Text line {}: {}", lineNumber, cleanLine);
                         }
+
                     } catch (JsonProcessingException e) {
                         log.warn("Failed to parse JSON at line {}: {}", lineNumber, cleanLine);
-
-                        Map<String, Object> errorData = new HashMap<>();
-                        errorData.put("lineNumber", lineNumber);
-                        errorData.put("type", "parse_error");
-                        errorData.put("message", "JSON parse failed: " + e.getMessage());
-                        errorData.put("rawLine", cleanLine);
-                        dtoList.add(sseDto);
-
-                    } catch (Exception e) {
-                        log.error("Error processing line {}: {}", lineNumber, cleanLine, e);
-
-                        // 에러 정보 전송
-                        Map<String, Object> errorData = new HashMap<>();
-                        errorData.put("lineNumber", lineNumber);
-                        errorData.put("type", "error");
-                        errorData.put("message", e.getMessage());
-                        errorData.put("rawLine", cleanLine);
-                        dtoList.add(sseDto);
                     }
-                }
-
-                // ✅ 타임아웃 포함 대기
-                boolean finished = process.waitFor(300, TimeUnit.SECONDS); // 5분
-
-                if (!finished) {
-                    log.warn("Nuclei process timeout, forcibly destroying");
-                    process.destroyForcibly();
-                }
-
-                int exitCode = process.exitValue();
-                scanMaster.complete();
-
-                List<ScanDetail> details = scanDetailRepository.findByScanId(scanId);
-                ScanScoreResult score = calculateScore(details);
-                scanMaster.setScore(score.score());
-                scanMaster.setGrade(score.grade());
-                scanMasterRepository.save(scanMaster);
-
-                // 완료 메시지 전송
-                Map<String, Object> completionData = new HashMap<>();
-                completionData.put("type", "complete");
-                completionData.put("exitCode", exitCode);
-                completionData.put("totalLines", lineNumber);
-                completionData.put("totalFindings", findings.size());
-                completionData.put("findings", findings);
-                completionData.put("timestamp", System.currentTimeMillis());
-                completionData.put("url", normalizedUrl); // ✅ URL 추가
-
-                sseDto = new SSEDto();
-                sseDto.setType(SSE_TYPE.END.name());
-                sseDto.setGrade(score.grade());
-                sseDto.setScore(score.score());
-                dtoList.add(sseDto);
-
-                log.info("Scan completed for {}: Exit code: {}, Total lines: {}, Findings: {}",
-                        normalizedUrl, exitCode, lineNumber, findings.size());
-
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt(); // ✅ 인터럽트 상태 복원
-                log.error("Scan interrupted for {}", normalizedUrl, e);
-            } catch (Exception e) {
-                log.error("Error during scan for {}", normalizedUrl, e);
-                scanMaster.fail(e.getMessage());
-                scanMasterRepository.save(scanMaster);
-            } finally {
-                if (reader != null) {
-                    try {
-                        reader.close();
-                    } catch (IOException e) {
-                        log.warn("Failed to close reader", e);
-                    }
-                }
-
-                if (process != null && process.isAlive()) {
-                    log.warn("Process still alive, destroying forcibly");
-                    process.destroyForcibly();
                 }
             }
+
+            // Process 종료까지 블로킹 (최대 5분)
+            boolean finished = process.waitFor(300, TimeUnit.SECONDS);
+            if (!finished) {
+                log.warn("Nuclei process timeout, forcibly destroying");
+                process.destroyForcibly();
+            }
+
+            int exitCode = process.exitValue();
+            scanMaster.complete();
+
+            List<ScanDetail> details = scanDetailRepository.findByScanId(scanId);
+            ScanScoreResult score = calculateScore(details);
+            scanMaster.setScore(score.score());
+            scanMaster.setGrade(score.grade());
+            scanMasterRepository.save(scanMaster);
+
+            // 최종 END DTO 생성
+            SSEDto endDto = new SSEDto();
+            endDto.setType(SSE_TYPE.END.name());
+            endDto.setGrade(score.grade());
+            endDto.setScore(score.score());
+            dtoList.add(endDto);
+
+            log.info("Scan completed for {}: Exit code: {}, Total findings: {}",
+                    normalizedUrl, exitCode, findings.size());
+
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            log.error("Scan interrupted for {}", normalizedUrl, e);
+            scanMaster.fail(e.getMessage());
+            scanMasterRepository.save(scanMaster);
+        } catch (Exception e) {
+            log.error("Error during scan for {}", normalizedUrl, e);
+            scanMaster.fail(e.getMessage());
+            scanMasterRepository.save(scanMaster);
+        } finally {
+            if (reader != null) {
+                try {
+                    reader.close();
+                } catch (IOException e) {
+                    log.warn("Failed to close reader", e);
+                }
+            }
+            if (process != null && process.isAlive()) {
+                process.destroyForcibly();
+            }
+        }
+
         return dtoList;
     }
 }
