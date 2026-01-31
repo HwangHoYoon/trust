@@ -665,7 +665,6 @@ public class ScanService {
         String normalizedUrl = normalizeUrl(url);
 
         List<SSEDto> dtoList = new ArrayList<>();
-        CompletableFuture.runAsync(() -> {
             Process process = null; // ✅ try-finally에서 정리하기 위해
             BufferedReader reader = null;
             String scanId = UUID.randomUUID().toString();
@@ -840,7 +839,6 @@ public class ScanService {
                     process.destroyForcibly();
                 }
             }
-        });
-        return null;
+        return dtoList;
     }
 }
