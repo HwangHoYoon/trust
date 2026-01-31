@@ -661,10 +661,12 @@ public class ScanService {
         });
     }
 
-    public List<Map<String, Object>> mcpAll(String url) {
+    public Map<String, Object> mcpAll(String url) {
 
         String normalizedUrl = normalizeUrl(url);
-        List<Map<String, Object>> result = new ArrayList<>();
+
+        Map<String, Object> response = new HashMap<>();
+        List<Map<String, Object>> findings = new ArrayList<>();
 
         Process process = null;
         BufferedReader reader = null;
@@ -672,6 +674,8 @@ public class ScanService {
 
         ScanMaster scanMaster = new ScanMaster(scanId, normalizedUrl);
         scanMasterRepository.save(scanMaster);
+
+        int findingCount = 0;
 
         try {
             ProcessBuilder processBuilder = new ProcessBuilder(
@@ -689,8 +693,6 @@ public class ScanService {
             );
 
             String line;
-            int findingCount = 0;
-
             while ((line = reader.readLine()) != null) {
                 String cleanLine = line.replaceAll("\u001b\\[[0-9;]*m", "");
 
@@ -703,13 +705,14 @@ public class ScanService {
                     findingCount++;
 
                     Map<String, Object> find = new HashMap<>();
-                    find.put("type", "FIND");
-                    find.put("name", ((Map<?, ?>) json.get("info")).get("name"));
-                    find.put("severity", ((Map<?, ?>) json.get("info")).get("severity"));
-                    find.put("description", ((Map<?, ?>) json.get("info")).get("description"));
+                    Map<?, ?> info = (Map<?, ?>) json.get("info");
+
+                    find.put("name", info.get("name"));
+                    find.put("severity", info.get("severity"));
+                    find.put("description", info.get("description"));
                     find.put("matched", json.get("matched-at"));
 
-                    result.add(find);
+                    findings.add(find);
                 }
             }
 
@@ -719,13 +722,13 @@ public class ScanService {
             List<ScanDetail> details = scanDetailRepository.findByScanId(scanId);
             ScanScoreResult score = calculateScore(details);
 
-            Map<String, Object> end = new HashMap<>();
-            end.put("type", "END");
-            end.put("totalFindings", findingCount);
-            end.put("grade", score.grade());
-            end.put("score", score.score());
-
-            result.add(end);
+            response.put("status", "DONE");
+            response.put("scanId", scanId);
+            response.put("url", normalizedUrl);
+            response.put("totalFindings", findingCount);
+            response.put("grade", score.grade());
+            response.put("score", score.score());
+            response.put("results", findings);
 
             scanMaster.complete();
             scanMaster.setScore(score.score());
@@ -733,15 +736,13 @@ public class ScanService {
             scanMasterRepository.save(scanMaster);
 
         } catch (Exception e) {
-            Map<String, Object> error = new HashMap<>();
-            error.put("type", "ERROR");
-            error.put("message", e.getMessage());
-            result.add(error);
+            response.put("status", "ERROR");
+            response.put("message", e.getMessage());
         } finally {
             try { if (reader != null) reader.close(); } catch (IOException ignored) {}
             if (process != null && process.isAlive()) process.destroyForcibly();
         }
 
-        return result;
+        return response;
     }
 }

@@ -11,7 +11,6 @@ import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
-import java.util.List;
 import java.util.Map;
 
 @RestController
@@ -43,8 +42,9 @@ public class ScanController {
         return emitter;
     }
 
-    @GetMapping(value = "/mcpAll")
-    public List<Map<String, Object>> mcpAll(@RequestParam String url) throws Exception {
+    @GetMapping("/mcpAll")
+    public Map<String, Object> mcpAll(@RequestParam String url) throws Exception {
+        // scanService.mcpAll(url) → Map<String,Object> 리턴
         return scanService.mcpAll(url);
     }
 
