@@ -1,6 +1,5 @@
 package com.fast.trust.scan.controller;
 
-import com.fast.trust.scan.dto.SSEDto;
 import com.fast.trust.scan.service.ScanService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -45,7 +44,7 @@ public class ScanController {
     }
 
     @GetMapping(value = "/mcpAll")
-    public List<SSEDto> mcpAll(@RequestParam String url) throws Exception {
+    public List<Map<String, Object>> mcpAll(@RequestParam String url) throws Exception {
         return scanService.mcpAll(url);
     }
 
